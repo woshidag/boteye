@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright 2017 Baidu Robotic Vision Authors. All Rights Reserved.
+ * Copyright 2017-2018 Baidu Robotic Vision Authors. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,36 +32,7 @@
 #include <algorithm>
 #include <mutex>
 #include <memory>  // unique_ptr
-class PoseDrawer2D {
- public:
-  constexpr static const int imageSize = 480;  // the same as camera image height
-  PoseDrawer2D();
-  /**
-   * Add a new pose for drawing
-   */
-  void addPose(float x, float y, float alpha);
-  /** Drawing function called by external thread
-   * Draw all the positions in history.
-   */
-  bool drawTo(cv::Mat* img_ptr);
 
- private:
-  cv::Point2f convertToImageCoordinates(const cv::Point2f & pointInMeters);
-  void drawPath(cv::Mat* img_ptr);
-  std::mutex data_io_mutex_;
-  std::list<cv::Point2f> paths_;
-  struct {
-    float x;
-    float y;
-    float alpha;
-  } latest_pose_;
-  std::atomic<float> scale_;
-  std::atomic<float> min_x_;
-  std::atomic<float> min_y_;
-  std::atomic<float> max_x_;
-  std::atomic<float> max_y_;
-  const float frameScale_ = 0.2;  // the scale of the axis in plot[m]
-};
 #ifdef HAS_OPENCV_VIZ
 class PoseDrawer3D {
  public:
@@ -80,7 +51,7 @@ class PoseDrawer3D {
    *                       This value is re-computed by this function.
    */
   void viz3d_once(const cv::Affine3f& W_T_D,
-                  const cv::Mat_<uchar>& img = cv::Mat_<uchar>(),
+                  const cv::Mat& img = cv::Mat(),
                   const cv::Mat& rig_xyz_mat = cv::Mat(),
                   const cv::Mat_<cv::Vec3f>& depth_result_img = cv::Mat_<cv::Vec3f>());
   uchar key_pressed() const;

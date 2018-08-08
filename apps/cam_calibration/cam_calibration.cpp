@@ -1,5 +1,5 @@
 /******************************************************************************
- * Copyright 2017 Baidu Robotic Vision Authors. All Rights Reserved.
+ * Copyright 2017-2018 Baidu Robotic Vision Authors. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <boost/lexical_cast.hpp>
 #include <XP/helper/tag_detector.h>  // For april tag detector
 #include <XP/helper/param.h>  // For load / save calib param
+#include <XP/util/calibration_utils.h>
 #include <Eigen/LU>  // For Matrix4f inverse
 #include <algorithm>
 #include <string>
@@ -39,13 +40,9 @@ using std::endl;
 using std::vector;
 using namespace boost::filesystem;  // NOLINT
 DEFINE_string(sensor_type,
-#ifdef __linux__  // predefined by gcc
-              "UNKNOWN", "LI or XP or XP2 or XP3 or OCV(openCV) or UDP (receiving)");
-#else
-              "OCV", "OCV (openCV)");
-#endif
+              "UNKNOWN", "XP or XP2 or XP3 or FACE XPIRL or XPIRL2 or XPIRL3 or UDP (receiving)");
 DEFINE_string(device_id, "", "device id of duo camera");
-DEFINE_string(folder_path, "", "folder containing l and r folders");
+DEFINE_string(record_path, "", "folder containing l and r folders");
 DEFINE_string(img_suffix, "png", "image suffix");
 DEFINE_bool(show_reproj, false, "whether or not show image with points in a debug window");
 DEFINE_bool(show_det, false, "whether or not show image with tag detection");
@@ -54,6 +51,7 @@ DEFINE_bool(fish_eye_model, false, "whether or not use the fish eye model");
 DEFINE_int32(valid_radius, 360,
              "The radius in pixel to check the point coverage from the pinhole center. "
              "Suggested value: 360 for 120 deg FOV and 220 for 170 deg FOV.");
+DEFINE_bool(no_distribution_check, false, "disable point distribution check");
 DEFINE_double(min_ratio, 0.4,
               "The required minimum ratio of detected points over the average per grid");
 DEFINE_double(square_size, -1, "length of the side of one tag");
@@ -66,7 +64,8 @@ DEFINE_bool(verify_mode, false, "verify reproj error of existing calib file");
 DEFINE_bool(no_ransac, false, "no ransac");
 DEFINE_bool(extrinsics_only, false, "only perform extrinsics calibration");
 DEFINE_int32(display_timeout, 500, "how many millisec does a window display. 0 is inf");
-DEFINE_int32(dist_order, 8, "8th or 6th order");
+DEFINE_int32(dist_order, 8, "8 (k1 k2 0 0 k3 k4 k5 k6) or 6 (k1 k2 0 0 k3) or 4 (k1 k2 p1 p2)"
+             " or 2 (k1 k2)");
 DEFINE_bool(single_cam_mode, false, "Only calibrate one camera.");
 
 // [NOTE] Assume 5x7 april tag is used.
@@ -108,84 +107,12 @@ cv::Point3f id2coordinate(const int det_id) {
   return coordinate;
 }
 
-// [NOTE] The grids are designed for 640 x 480 for now.
-bool check_grid_point_density(const vector<vector<cv::Point2f> >& detected_corners,
-                              const cv::Size& img_size,
-                              const float min_ratio,
-                              const int valid_radius,
-                              const cv::Point2f& pinhole,
-                              const bool verbose = false,
-                              cv::Mat* det_img = nullptr) {
-  CHECK_GT(img_size.width, 0);
-  CHECK_GT(img_size.height, 0);
-  constexpr int grid_size = 80;
-  const int grid_cols = img_size.width / grid_size;
-  const int grid_rows = img_size.height / grid_size;
-  cv::Mat grid_points(grid_rows, grid_cols, CV_32S);
-  grid_points.setTo(0);
-  int total_points = 0;
-  for (const vector<cv::Point2f>& corners : detected_corners) {
-    for (const cv::Point2f& pt : corners) {
-      if (pt.x < 0 || pt.x > img_size.width ||
-          pt.y < 0 || pt.y > img_size.height) {
-        continue;
-      }
-      int col = pt.x / grid_size;
-      int row = pt.y / grid_size;
-      CHECK_LT(col, grid_cols);
-      CHECK_LT(row, grid_rows);
-      ++grid_points.at<int>(row, col);
-      ++total_points;
-    }
-  }
-
-  // Compute a rough mask based on valid_raiuds
-  cv::Mat grid_weights(grid_rows, grid_cols, CV_32S);
-  grid_weights.setTo(0);
-  const int valid_radius2 = valid_radius * valid_radius;
-  for (int i = 0; i < img_size.height; ++i) {
-    for (int j = 0; j < img_size.width; ++j) {
-      int row = i / grid_size;
-      int col = j / grid_size;
-      if ((pinhole.x - j) * (pinhole.x - j) + (pinhole.y - i) * (pinhole.y - i) < valid_radius2) {
-        ++grid_weights.at<int>(row, col);
-      } else if (det_img != nullptr) {
-        // Visualize the *mask* with dark red
-        det_img->at<cv::Vec3b>(i, j) = cv::Vec3b(0, 0, 60);
-      }
-    }
-  }
-
-  // A heuristic to check the point distribution lower bound
-  const int avg_point_per_grid = total_points / (grid_cols * grid_rows);
-  int bad_grid_count = 0;
-  for (int row = 0; row < grid_rows; ++row) {
-    for (int col = 0; col < grid_cols; ++col) {
-      const int minimum_required_point =
-          avg_point_per_grid * grid_weights.at<int>(row, col) / (grid_size * grid_size) * min_ratio;
-      if (grid_points.at<int>(row, col) < minimum_required_point) {
-        ++bad_grid_count;
-        if (verbose) {
-          std::cout << "Grid[" << row << ", " << col << "] has / requires "
-                    << grid_points.at<int>(row, col) << " / " << minimum_required_point
-                    << " points\n";
-        }
-        if (det_img != nullptr) {
-          cv::Rect rect(col * grid_size, row * grid_size, grid_size, grid_size);
-          cv::rectangle(*det_img, rect, cv::Scalar(0, 0, 255));
-        }
-      }
-    }
-  }
-  return bad_grid_count == 0;
-}
-
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
   google::ParseCommandLineFlags(&argc, &argv, false);
   google::InstallFailureSignalHandler();
   FLAGS_colorlogtostderr = 1;
-  if (FLAGS_folder_path.size() == 0) {
+  if (FLAGS_record_path.size() == 0) {
     google::ShowUsageWithFlags(argv[0]);
     return -1;
   }
@@ -194,8 +121,11 @@ int main(int argc, char** argv) {
     google::ShowUsageWithFlags(argv[0]);
     return -1;
   }
-  if (FLAGS_dist_order != 8 && FLAGS_dist_order != 6) {
-    LOG(ERROR) << "distortion order has to be 8 or 6";
+  if (FLAGS_dist_order != 8 &&
+      FLAGS_dist_order != 6 &&
+      FLAGS_dist_order != 4 &&
+      FLAGS_dist_order != 2) {
+    LOG(ERROR) << "distortion order has to be 8 or 6 or 4 or 2";
     return -1;
   }
   if (FLAGS_extrinsics_only && (FLAGS_load_calib_yaml.empty())) {
@@ -232,7 +162,7 @@ int main(int argc, char** argv) {
 
   // Detect corners first
   for (int lr = 0; lr < camera_max_index; ++lr) {
-    boost::filesystem::path folder_path(FLAGS_folder_path + "/" + lr_folders[lr]);
+    boost::filesystem::path folder_path(FLAGS_record_path + "/" + lr_folders[lr]);
     if (!is_directory(folder_path)) {
       LOG(ERROR) << folder_path << " is not a folder";
       return -1;
@@ -322,22 +252,21 @@ int main(int argc, char** argv) {
 
   // Check point coverage
   bool point_coverage_ok = true;
-  {
+  if (!FLAGS_no_distribution_check) {
     cv::Mat det_img(img_size.height, img_size.width * camera_max_index, CV_8UC3);
     det_img.setTo(cv::Vec3b(0, 0, 0));
     for (int cam_idx = 0; cam_idx < camera_max_index; ++cam_idx) {
       cv::Mat det_img_this = det_img(cv::Rect(img_size.width * cam_idx, 0,
                                               img_size.width, img_size.height));
       const vector<DetectedCorners>& detected_corners_all = detected_corners_all_lr[cam_idx];
-      // We use a more strict ratio here and a looser ratio for ransac later
-      float min_ratio_strict = std::min(FLAGS_min_ratio * 1.1, 0.9);
-      if (check_grid_point_density(detected_corners_all,
-                                   img_size,
-                                   min_ratio_strict,
-                                   FLAGS_valid_radius,
-                                   cv::Point2f(img_size.width / 2, img_size.height / 2),
-                                   true /*verbose*/,
-                                   &det_img_this)) {
+      float min_ratio = std::min(FLAGS_min_ratio, 0.9);
+      if (XP::check_grid_point_density(detected_corners_all,
+                                       img_size,
+                                       min_ratio,
+                                       FLAGS_valid_radius,
+                                       cv::Point2f(img_size.width / 2, img_size.height / 2),
+                                       true /*verbose*/,
+                                       &det_img_this)) {
         std::cout << "[OK] point distribution check for camera " << cam_idx << "\n";
       } else {
         std::cout << "WARNING: suggest to take more pictures for camera " << cam_idx << "!!!\n";
@@ -418,10 +347,23 @@ int main(int argc, char** argv) {
         }
         cv::Mat K_ransac = cv::Mat::eye(3, 3, CV_64F);
         cv::Mat dist_ransac;
-        int calib_flag = CV_CALIB_ZERO_TANGENT_DIST;
-        if (FLAGS_dist_order == 6) {
+        int calib_flag;
+        if (FLAGS_dist_order == 2) {
+          calib_flag = (CV_CALIB_ZERO_TANGENT_DIST |
+                        CV_CALIB_FIX_K3 |
+                        CV_CALIB_FIX_K4 |
+                        CV_CALIB_FIX_K5 |
+                        CV_CALIB_FIX_K6);
+        } else if (FLAGS_dist_order == 4) {
+          calib_flag = (CV_CALIB_FIX_K3 |
+                        CV_CALIB_FIX_K4 |
+                        CV_CALIB_FIX_K5 |
+                        CV_CALIB_FIX_K6);
+        } else if (FLAGS_dist_order == 6) {
+          calib_flag = CV_CALIB_ZERO_TANGENT_DIST;
         } else if (FLAGS_dist_order == 8) {
-          calib_flag = calib_flag | CV_CALIB_RATIONAL_MODEL;
+          calib_flag = (CV_CALIB_ZERO_TANGENT_DIST |
+                        CV_CALIB_RATIONAL_MODEL);
         } else {
           LOG(FATAL) << "FLAGS_dist_order = " << FLAGS_dist_order;
         }
@@ -468,16 +410,18 @@ int main(int argc, char** argv) {
             reproj_corners_this_exp.push_back(corner_reproj);
           }
         }
-        if (!check_grid_point_density(reproj_corners_this_exp,
-                                      img_size,
-                                      FLAGS_min_ratio,
-                                      FLAGS_valid_radius,
-                                      cv::Point2f(K_ransac.at<double>(0, 2),
-                                                  K_ransac.at<double>(1, 2)),
-                                      true /*verbose*/)) {
-          cout << "ransac exp " << it_exp << " seed_reproj_error " << seed_reproj_error
-               << " inlier pnts doesn't have good point coverage\n";
-          continue;
+        if (!FLAGS_no_distribution_check) {
+          if (!XP::check_grid_point_density(reproj_corners_this_exp,
+                                            img_size,
+                                            FLAGS_min_ratio,
+                                            FLAGS_valid_radius,
+                                            cv::Point2f(K_ransac.at<double>(0, 2),
+                                                        K_ransac.at<double>(1, 2)),
+                                            true /*verbose*/)) {
+            cout << "ransac exp " << it_exp << " seed_reproj_error " << seed_reproj_error
+                << " inlier pnts doesn't have good point coverage\n";
+            continue;
+          }
         }
         if (min_inlier_num > good_ids.size()) {
           cout << "ransac exp " << it_exp << " seed_reproj_error " << seed_reproj_error
@@ -495,10 +439,27 @@ int main(int argc, char** argv) {
         }
         float final_reproj_error = seed_reproj_error;
         if (!FLAGS_no_ransac) {
-          int calib_flag = CV_CALIB_USE_INTRINSIC_GUESS | CV_CALIB_ZERO_TANGENT_DIST;
-          if (FLAGS_dist_order == 8) {
-            calib_flag = calib_flag | CV_CALIB_RATIONAL_MODEL;
+          int calib_flag;
+          if (FLAGS_dist_order == 2) {
+            calib_flag = (CV_CALIB_USE_INTRINSIC_GUESS |
+                          CV_CALIB_ZERO_TANGENT_DIST |
+                          CV_CALIB_FIX_K3 |
+                          CV_CALIB_FIX_K4 |
+                          CV_CALIB_FIX_K5 |
+                          CV_CALIB_FIX_K6);
+          } else if (FLAGS_dist_order == 4) {
+            calib_flag = (CV_CALIB_USE_INTRINSIC_GUESS |
+                          CV_CALIB_FIX_K3 |
+                          CV_CALIB_FIX_K4 |
+                          CV_CALIB_FIX_K5 |
+                          CV_CALIB_FIX_K6);
           } else if (FLAGS_dist_order == 6) {
+            calib_flag = (CV_CALIB_USE_INTRINSIC_GUESS |
+                          CV_CALIB_ZERO_TANGENT_DIST);
+          } else if (FLAGS_dist_order == 8) {
+            calib_flag = (CV_CALIB_USE_INTRINSIC_GUESS |
+                          CV_CALIB_ZERO_TANGENT_DIST |
+                          CV_CALIB_RATIONAL_MODEL);
           } else {
             LOG(FATAL) << "FLAGS_dist_order = " << FLAGS_dist_order;
           }
@@ -520,8 +481,8 @@ int main(int argc, char** argv) {
              << " final_reproj_error " << final_reproj_error
              << " inlier num " << corresponding_board_coordinates_good.size() << std::endl;
         if (corresponding_board_coordinates_good.size() == detected_corners_all.size()) {
-            cout << "all imgs are inliers. Done" << std::endl;
-            break;
+          cout << "all imgs are inliers. Done" << std::endl;
+          break;
         }
       }
       if (best_reproj_error > 4 && !FLAGS_no_ransac) {
@@ -864,16 +825,20 @@ int main(int argc, char** argv) {
                                                   img_size.width, img_size.height)));
   }
   if (FLAGS_sensor_type == "UNKNOWN" ||
-      FLAGS_sensor_type == "OCV") {
+      FLAGS_sensor_type == "FACE") {
     duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::UNKNOWN;
-  } else if (FLAGS_sensor_type == "LI") {
-    duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::LI;
   } else if (FLAGS_sensor_type == "XP") {
     duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::XP;
   } else if (FLAGS_sensor_type == "XP2") {
     duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::XP2;
   } else if (FLAGS_sensor_type == "XP3") {
     duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::XP3;
+  } else if (FLAGS_sensor_type == "XPIRL") {
+    duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::XPIRL;
+  } else if (FLAGS_sensor_type == "XPIRL2") {
+    duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::XPIRL2;
+  } else if (FLAGS_sensor_type == "XPIRL3") {
+    duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::XPIRL3;
   } else {
     LOG(ERROR) << "Unsupport sensor type";
     duo_calib_param.sensor_type = XP::DuoCalibParam::SensorType::UNKNOWN;
@@ -896,6 +861,23 @@ int main(int argc, char** argv) {
     out.close();
     if (!duo_calib_param.WriteToYaml(FLAGS_save_calib_yaml)) {
       LOG(ERROR) << "Save to " << FLAGS_save_calib_yaml << " failed";
+    }
+    if (FLAGS_sensor_type == "XPIRL3" || FLAGS_sensor_type == "XPIRL2") {
+      XP::DuoCalibParam duo_calib_param_ir = duo_calib_param;
+      for (int i = 0; i < 2; i++) {
+        duo_calib_param_ir.Camera.cameraK_lr[i](0, 0) /= 2;
+        duo_calib_param_ir.Camera.cameraK_lr[i](0, 2) /= 2;
+        duo_calib_param_ir.Camera.cameraK_lr[i](1, 1) /= 2;
+        duo_calib_param_ir.Camera.cameraK_lr[i](1, 2) /= 2;
+      }
+      duo_calib_param_ir.Camera.img_size /= 2;
+      boost::filesystem::path calib_path(FLAGS_save_calib_yaml);
+      std::string ir_calib_path = calib_path.parent_path().string()
+                                  + "/ir_" + calib_path.filename().string();
+      std::cout << "save ir calib yaml" << std::endl;
+      if (!duo_calib_param_ir.WriteToYaml(ir_calib_path)) {
+        LOG(ERROR) << "Save to " << FLAGS_save_calib_yaml << " failed";
+      }
     }
   }
   cv::imwrite(reproj_filename, reproj_img);

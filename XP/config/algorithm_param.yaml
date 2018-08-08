@@ -1,13 +1,3 @@
-InitVar:
-  p_init_var: 0.0009
-  q_init_var: 0.0001
-  v_init_var: 0.0009
-  bg_init_var: 2.5e-06
-  ba_init_var: 0.0004
-  Sa_init_var: 0.04
-  BpC_init_var: 0
-  CBea_init_var: 0.00
-  Vs_init_var: 0.0001
 FeatDetParam:
   pyra_level: 2
   fast_det_thresh: 10
@@ -31,8 +21,7 @@ MappingMode:
   ignore_feat_on_floor: false
   fix_height_value: false  # this also affects vio tracker
 Mapping:
-  # 20 / 400
-  max_feature_search_range: 0.05
+  max_feature_search_range: 0.05  # 20 / 400
   min_keyrig_gap_num: 10
   min_keyrig_gap_time_sec: 0.5
   min_gen_local_map_gap_num: 10
@@ -46,12 +35,9 @@ Mapping:
   local_ba_min_movalble_rig_num: 1
   local_ba_max_movalble_rig_num: 3
   feat_det_num: 300 # uniform radius will limit the number of points
-  feat_det_pyra_level: 4  # Do feat detection on all the levels <= this val
+  feat_det_pyra_level: 4  # Total level of pyramids used for feature detections, e.g., 4 means pyra0, 1, 2, 3
   slave_det: direct # epi or direct
-  occupancy_vote_cell_size: 0.1
   feat_det_uniform_radius: 32
-  run_dense_stereo_freq: 10 # How often do we run left and right image dense matching
-  camera_to_floor_height: 0.5 # Only used in dense mapping mode. To remove floor
   max_vio_fail_count_tolerance: 20 # 1 sec
   short_term_vio_fail_count: 3
   max_reloc_attempt: 5
@@ -59,7 +45,7 @@ Mapping:
   loop_close_cooldown_sec: 10.0
   max_lost_sec_before_use_vio_to_reset: 1
   smoothing_time_length: 0.2
-  calib_verify_stereo_good_match_num: 20
+  calib_verify_stereo_good_match_ratio: 0.9
 Tracking:
   max_feature_search_range: 0.025  # 10 / 400
   orb_match_dist_thresh: 51  # range is 0 - 255
@@ -67,8 +53,6 @@ Tracking:
   feature_uncertainty: 10
   # Turn on either use_of_id or use_april_tag will force vio config matchWithId to true
   imaging_FPS: 999 # use the fastest image rate (25Hz for XP cam)
-  imaging_gain: 30
-  imaging_exposure: 30
   aec_index: 100  # [0 to 167]
   use_of_id: true
   undistort_before_vio: false
@@ -85,5 +69,17 @@ Reloc:
   use_pnp: true # or relative pose
   H_inlier_pixel_dis: 0.025 # 10 pixels with f = 400
   matches_area_ratio: 0.5 # 0 - 1
+  small_error_count_thres: 25
+  check_with_noncentral_rel: true
+  redo_bootstrap: true       # re-bootstrap the query pose to the best ref pose
+  use_input_rotation: false  # only solve translation
+Depth:
+  horizontal_bucket_num: 30
+  height_below_cam: -0.5 # Used to filter out the depth from the ground (m)
+  height_above_cam: 0.6 # Used to filter out the depth from the ceiling (m)
+  depth_confidence: 0.2
+  run_dense_stereo_freq: 10 # How often do we run left and right image dense matching
+  camera_to_floor_height: 0.5 # Only used in dense mapping mode. To remove floor
+  use_stereo_sgbm: true  # stereo sgbm provides denser depth with 3x-5x computation
 Nature:
   gravity: [0, 0, -9.799]
